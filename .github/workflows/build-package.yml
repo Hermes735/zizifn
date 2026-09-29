@@ -1,0 +1,102 @@
+name: ⚪ Build Panel Package
+
+# Builds the deployable package (panel.json) that the panel-deployer bot uploads
+# to Cloudflare accounts. panel.json = all worker files (base64) + deploy metadata.
+# Stable asset URL: /releases/download/panel-latest/panel.json
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "index.js"
+      - "src/**"
+      - "Cargo.toml"
+      - "index.html"
+      - "wrangler.toml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - name: ▶Checkout code
+        uses: actions/checkout@v7
+
+      - name: ▶Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: ▶Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: ▶Build wasm
+        run: wasm-pack build --target web
+
+      - name: ▶Encode panel
+        run: base64 -w0 index.html > src/panel.b64
+
+      - name: ▶Assemble panel.json
+        run: |
+          python3 - <<'PY'
+          import base64, json, os, re, pathlib
+
+          root = pathlib.Path(".")
+          main_module = "index.js"
+          compat = re.search(r'compatibility_date\s*=\s*"([^"]+)"', (root / "wrangler.toml").read_text()).group(1)
+
+          files = [
+              ("index.js", "application/javascript+module"),
+              ("src/clash.js", "application/javascript+module"),
+              ("src/core.js", "application/javascript+module"),
+              ("src/network.js", "application/javascript+module"),
+              ("src/routes.js", "application/javascript+module"),
+              ("src/panel.b64", "text/plain"),
+              ("pkg/zr_wasm.js", "application/javascript+module"),
+              ("pkg/zr_wasm_bg.wasm", "application/wasm"),
+          ]
+
+          out = []
+          for path, ctype in files:
+              p = root / path
+              if not p.exists():
+                  raise SystemExit(f"missing build output: {path}")
+              out.append({
+                  "path": path,
+                  "content_type": ctype,
+                  "b64": base64.b64encode(p.read_bytes()).decode(),
+              })
+
+          rules = [
+              {"type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": False},
+              {"type": "Text", "globs": ["**/*.b64"], "fallthrough": True},
+          ]
+
+          pkg = {
+              "format": "panel-package/1",
+              "panel_id": "zizifn",
+              "main_module": main_module,
+              "compatibility_date": compat,
+              "rules": rules,
+              "files": out,
+          }
+          (root / "panel.json").write_text(json.dumps(pkg, ensure_ascii=False))
+          print("panel.json bytes:", (root / "panel.json").stat().st_size,
+                "| files:", len(out),
+                "| compat:", compat)
+          PY
+
+      - name: ▶Publish release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: panel-latest
+          name: panel-latest
+          files: panel.json
+          overwrite: true
+          make_latest: false
+          body: Built deployable package for the panel-deployer bot.
